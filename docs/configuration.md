@@ -1,0 +1,409 @@
+# Configuration
+
+thinkNXG Pilot stores configuration in two TOML files:
+
+- `bench.toml` contains settings for one bench.
+- `common_config.toml` sits beside the bench directories and contains settings shared by all benches on the host.
+
+Use `BenchConfig` and thinkNXG Pilot's TOML store to read or write either file. Do not read `common_config.toml` directly.
+
+## Quick start
+
+```toml
+[bench]
+name = "main"
+python = "3.11"
+http_port = 8000
+socketio_port = 9000
+socketio_backend = "node"
+db_type = "mariadb"
+
+[[apps]]
+name = "frappe"
+repo = "https://github.com/frappe/frappe"
+branch = "version-15"
+
+[redis]
+cache_port = 13000
+queue_port = 11000
+
+[[workers]]
+queues = ["default", "short", "long"]
+count = 1
+```
+
+The first app is the framework app. A bench uses one database type for all its sites. Supported types are `mariadb` and `postgres`.
+
+## Bench settings
+
+The `[bench]` table supports:
+
+| Key | Purpose |
+| --- | --- |
+| `name` | Required bench name. |
+| `python` | Required Python version. |
+| `http_port` | Local web port. |
+| `socketio_port` | Realtime port when processes are separate. |
+| `socketio_backend` | `node` or `python`. |
+| `db_type` | `mariadb` or `postgres`. |
+| `default_branch` | Default branch for new apps. |
+| `allow_developer_mode` | Allows per-site developer mode changes. |
+| `watch_apps_js`, `watch_admin_js`, `reload_python` | Development reload settings. |
+| `install_dev_extra` | Install apps' `dev` extras on a non-production bench. Defaults to true; `pilot init --no-dev` sets it to false. |
+| `onboarding` | State of the onboarding dialog: empty shows it, `minimized` shows in sidebar card only, `dismissed` hides both |
+
+Applications use `[[apps]]` entries. `branches` can list branches available to the app:
+
+```toml
+[[apps]]
+name = "erpnext"
+repo = "https://github.com/frappe/erpnext"
+branch = "version-15"
+branches = ["version-15", "develop"]
+```
+
+An app that the marketplace registry lists updates to the registry's newest release for its branch. It updates to the branch tip instead when the registry has no release for that branch, or when the entry sets `follow_branch = true`, for example a developer who pushes to the app's own repository:
+
+```toml
+[[apps]]
+name = "myapp"
+repo = "https://github.com/frappe/myapp"
+branch = "develop"
+follow_branch = true
+```
+
+A linked app uses `path` instead of `repo` and `branch`. thinkNXG Pilot symlinks that checkout into `apps/` and never pulls, switches, or checks out commits in it. `pilot dev setup` writes this entry:
+
+```toml
+[[apps]]
+name = "gameplan"
+path = "/home/me/Projects/gameplan"
+```
+
+A registry release is offered only when it is newer than the installed commit. A full clone checks that the release descends from it. A shallow clone fetches only the release commit, without the history between them, so a newer version decides, and between equal versions, such as `17.0.0-dev` on `develop`, a later commit date decides.
+
+`[redis]` defines separate cache and queue ports. thinkNXG Pilot writes them to `config/redis_cache.conf` and `config/redis_queue.conf` inside a `PILOT MANAGED BLOCK` and keeps the lines outside it, such as `loadmodule /path/to/redisearch.so`. `[[workers]]` defines queue groups, their process counts and an optional `timeout`: the default job timeout of the group's queues, in seconds. Without it, thinkNXG uses 1500 for `long` and 300 for other queues. Two groups cannot give one queue different timeouts. Lite mode folds the groups into one, which takes the longest timeout; there a blank timeout counts as thinkNXG's default for its queues. thinkNXG only knows `default`, `short` and `long`, so thinkNXG Pilot lists every other queue, and every queue with a timeout, under `workers` in `sites/common_site_config.json`. thinkNXG Pilot leaves entries there for queues that no worker group lists.
+
+## Runtime modes
+
+```toml
+[production]
+enabled = true
+process_manager = "systemd" # or "supervisor"
+```
+
+Lite mode runs web, realtime, and jobs in one process:
+
+```toml
+[lite_mode]
+enabled = true
+restart_after_requests = 5000
+restart_after_jobs = 500
+restart_idle_seconds = 300
+request_drain_seconds = 60
+job_drain_seconds = 600
+```
+
+Request and job limits are counted from the last restart; `0` disables a limit. The process waits until it is idle before restarting. Drain settings bound graceful shutdown; a job that exceeds its limit is abandoned. Lite mode uses one worker group, so multiple groups are merged by taking the union of queues, the sum of their counts and the longest timeout.
+
+The process listens on `127.0.0.1:<http_port>` and serves realtime there too. thinkNXG Pilot updates `common_site_config.json` and nginx when lite mode changes. thinkNXG must provide `frappe/runner.py`; otherwise thinkNXG Pilot disables lite mode.
+
+## Admin and sites
+
+```toml
+[admin]
+enabled = true
+port = 7000
+domain = "admin.example.com"
+tls = true
+allow_bench_management = true
+```
+
+With `enabled = false`, `pilot start` does not run the Admin. `pilot dev setup` creates benches this way.
+
+Nginx proxies admin traffic to `port + 1` on localhost. In production, `admin.domain` is required. `allow_bench_management` permits this admin to manage sibling benches and defaults to enabled only for development installs. It also permits killing database processes and purging binlogs, because both affect every bench on the host. Database settings and the MariaDB restart do not need it.
+
+A production site calls thinkNXG Pilot at the loopback `pilot_endpoint` in its `site_config.json`, independently of DNS or `admin.domain`. The browser loads Cloud Settings assets from `cloud_settings_embed_url = "/_pilot"`; nginx serves `/_pilot/embed/cloud-settings/` on the site's origin. API calls still pass through thinkNXG with the server-held site token. `cloud_server_url` holds the public admin URL for dashboard links and follows admin domain changes. Development benches without nginx retain the public admin embed URL. The `serve_site_embeds_locally` upgrade patch publishes nginx routes before updating existing production site configs and clearing their caches.
+
+Set the admin password with `pilot set-admin-password` or the Settings page. thinkNXG Pilot stores a PBKDF2-HMAC-SHA256 verifier. `jwt_secret` is local; `jwks_url` and `jwks_audience` are for a remote token issuer and are host-shared. thinkNXG Pilot keeps the issuer's public keys in `.jwks-cache.json` in the benches directory. A token whose key is in the cache is verified without a fetch, and a cache older than one minute is refreshed in the background. A key that is not in the cache causes a fetch, at most once every 30 seconds. A failed fetch keeps the cached keys.
+
+Site-specific settings, including developer mode, live in each site's `site_config.json`.
+
+### Per-domain TLS
+
+A site answers on its own name plus every entry in its `site_config.json` `domains` list. The `ssl` flag records whether clients use HTTPS for the site. A bare hostname follows that flag for both public and origin TLS. A route mapping decides public and origin TLS separately:
+
+```json
+{
+  "ssl": false,
+  "domains": [
+    "www.example.com",
+    {
+      "domain": "shop.customer.com",
+      "route": {
+        "public_scheme": "https",
+        "origin_scheme": "https",
+        "client_ip_source": "proxy_protocol_v2"
+      }
+    }
+  ]
+}
+```
+
+thinkNXG Pilot creates one virtual host for each origin mode. A provider route can use HTTPS for clients and HTTP for its thinkNXG Pilot origin.
+
+thinkNXG Pilot stores `ssl: true` and shows this route as TLS, but it does not get a certificate. A passthrough route uses HTTPS for both connections.
+
+thinkNXG Pilot gets the passthrough certificate. thinkNXG Pilot also accepts the client IP source from the provider policy.
+
+thinkNXG Pilot keeps the site route policy in `site_config.json`. Each attached domain can have a different route policy.
+
+A domain the certificate does not name is served over HTTP rather than off a certificate that would fail to validate, so a half-finished `--expand` costs only that domain. Certificates are held in a certbot lineage named by the site's `cert_name`, defaulting to the site name; [renaming](commands.md#renaming-without-downtime) pins it so the certificate survives the site changing name.
+
+## Other bench tables
+
+These tables are per-bench unless noted otherwise:
+
+- `[gunicorn]`: Gunicorn settings.
+- `[build]`: manual override for the asset build memory cap.
+- `[processes]`: `disabled`, the app processes that stay off. `pilot processes disable` and `enable` write it. See [App Processes](app-processes.md).
+- `[firewall]`: firewall behavior.
+- `[waf]`: WAF rules and behavior.
+- `[s3]`: backup storage credentials and bucket settings. Set `endpoint_url` for a custom S3-compatible provider. With the `frappe` provider, thinkNXG Pilot connects to the private address of `internal-<endpoint host>` when this machine can reach it, and keeps the endpoint host for TLS and signatures. Presigned download URLs keep the public host. upload_migration_backups` (default `true`) puts the MariaDB backup that thinkNXG Pilot takes before an update into the bucket, not on the local disk. thinkNXG Pilot ignores it when the bucket is not configured.
+- `[llm]`: admin assistant provider settings.
+- `[resource_limits]`: CPU, memory, disk, uptime, and webhook alerts.
+
+`[monitor]` contains this bench's application metric log path. Host-wide system, database, and slow-query logs always use `cli_root()/system/logs/` and cannot be configured.
+
+Nginx is shared by every bench on the host, so its listen ports live in `common_config.toml`, not `bench.toml`. A `[nginx]` table in `bench.toml` is an error. See [Nginx Ports](#nginx-ports).
+
+Unknown fields are ignored during normal loads. Strict validation reports them.
+
+## Shared host configuration
+
+`common_config.toml` contains one copy of host-level settings:
+
+```toml
+[mariadb]
+host = "localhost"
+port = 3306
+admin_user = "root"
+root_password = ""
+socket_path = ""
+existing = false
+memory_share = 0.5
+
+[postgres]
+host = "localhost"
+port = 5432
+admin_user = "postgres"
+root_password = ""
+existing = false
+
+[letsencrypt]
+email = "ops@example.com"
+webroot_path = "/var/www/letsencrypt"
+
+[central]
+enabled = false
+bootstrapped = false
+
+[[central.hostname_aliases]]
+type = "site"
+pattern = "site-*.par-1.frappe.cloud"
+target = "site1.local"
+redirect = true
+
+[[central.hostname_aliases]]
+type = "admin"
+pattern = "vm-*.par-1.frappe.cloud"
+target = "admin.local"
+redirect = true
+
+[proxy]
+protocol_v2 = false
+cloudflare = false
+
+[telemetry]
+endpoint = "https://telemetry-svc.par-1.frappe.cloud"
+token = ""
+logs_enabled = true
+metrics_enabled = true
+
+[admin]
+jwks_url = "https://issuer.example.com/jwks.json"
+jwks_audience = "bench-fleet"
+
+[resource_limits]
+cpu_usage_limit = 85
+memory_usage_limit = 90
+disk_space_limit = 0
+site_uptime = true
+email_recipients = ["ops@example.com"]
+
+[[webhook_endpoints]]
+url = "https://alerts.example.com/pilot"
+token = "shared-secret"
+events = ["site_down", "task_failed"]
+
+[frappe_cloud]
+url = "https://cloud.frappe.io"
+```
+
+Shared tables are MariaDB, Postgres, Let's Encrypt, Central, the edge proxy, telemetry, resource limits, webhook endpoints, thinkNXG Cloud, and the admin JWKS issuer. A bench exposes these values through its own `BenchConfig`; the model merges shared values on read and writes them back to the common file.
+
+Central endpoint and authentication data come from instance metadata. While Central is enabled and bootstrap is pending, remote-token verification uses only the current staged JWKS URL, audience, and initial key set from instance metadata. thinkNXG Pilot caches that staged issuer in each Admin process until shared config changes or bootstrap completes. After bootstrap, it clears the staged entry and uses only the issuer saved in shared config. The metadata can include `initial_jwks_cache`, the issuer's JWK set. thinkNXG Pilot uses it to initialize an empty JWKS cache before it marks the host bootstrapped, so the first remote token does not wait for an issuer fetch. It does not replace keys already fetched from the issuer. The Central configuration is in the `pilot-central` attribute. Three optional attributes hold [JSON Merge Patches](https://www.rfc-editor.org/rfc/rfc7396) for config files: `pilot-common-config` for `common_config.toml`, `pilot-config` for `bench.toml`, and `pilot-common-site-config` for `sites/common_site_config.json`. For example, `pilot-config` can hold `{"s3": {"bucket": "team-backups"}}`. A patch changes only the keys it names, and `null` resets a key to its default. `pilot-common-config` must not change `central`, because bootstrap owns that table. thinkNXG Pilot rejects unknown TOML keys and validates the result before it writes a file. thinkNXG Pilot applies the patches once, during bootstrap, before it marks the host bootstrapped, and does not read them again. Central must write them before `pilot-central`. Each file has its own attribute because the cloud caps a metadata value at 1 KiB. `central.hostname_aliases` maps a VM hostname pattern to its current local target. The VM ID is assigned at runtime, so use `*` for that part. A pattern such as `*.par-1.frappe.cloud` matches every name in the zone. When patterns overlap, the pattern with the most literal text wins, so `admin-vm-*.par-1.frappe.cloud` takes precedence over it, and a site's own domains take precedence over every pattern. thinkNXG Pilot creates redirect rules only for aliases whose targets exist on the bench. A redirecting site alias sends clients to the site's primary domain, on the scheme clients reach it with, but still answers `/api/method/ping`, because Central probes the alias for readiness without following redirects. Renaming a site or moving the admin domain re-points the matching alias automatically; remove one when the rule is no longer needed. `pilot setup central` writes these settings - see [Setup Commands](commands.md#setup-commands).
+
+Before it applies the Central credential, bootstrap sizes thinkNXG Pilot's MariaDB for the VM's memory, because an image built on another host keeps that host's sizing. It writes `my.cnf` and the unit for the next start, then applies the values to the running server without a restart: the buffer pool and its automatic minimum, `innodb_log_file_size`, `key_buffer_size`, and `max_connections`. An option set in `managed.cnf` keeps its value. The buffer pool cannot grow above the running `innodb_buffer_pool_size_max`, so a larger pool waits for the next start. Higher unit memory limits apply before MariaDB grows. Lower limits apply only after MariaDB uses less than the new `MemoryHigh`. The unit file is written last, after the limits apply; if the usage stays higher or cannot be read for a minute, the old unit stays and a later attempt tries again.
+
+The user unit `pilot-mariadb-sizing.service` prepares MariaDB before its first start in each host boot and stays active for that boot. thinkNXG Pilot records the boot ID and total host RAM in `memory-sizing.json`. On the first allocation, or a new boot with changed RAM, it recalculates the generated settings and clears custom buffer-pool sizes, log-file size, key-buffer size, and connection count. A MariaDB restart or a host reboot with unchanged RAM preserves custom database variables. Service memory limits are recalculated from host RAM and `mariadb.memory_share` at each boot. Other database-variable overrides, including `innodb_snapshot_isolation`, remain unchanged. The upgrade patch records the current host capacity and starts the sizing service outside the database action lock, so installation preserves existing settings and the first MariaDB restart can proceed.
+
+`MemoryHigh` and `MemoryMax` are internal service limits. They are not shown in Database Configurations, and the API rejects manual changes, including previously queued changes. Use the database memory split to change the allocation. Legacy `mariadb.memory_high_mb` and `mariadb.memory_max_mb` values are ignored and cleared at the next host boot. Swap is not editable here.
+
+`innodb_snapshot_isolation` is editable in Database Configurations. Its warning explains that enabling it can reject conflicting updates or deletes and roll back transactions; disabling it removes that conflict protection. The change affects new connections to the shared database. Existing connections retain their session setting. The custom value is saved in `managed.cnf` and survives host RAM changes.
+
+The buffer-pool editor also caps its maximum below the effective MariaDB `MemoryMax`, in addition to the host-based range. The setter reads the hard limit again under the database action lock before writing settings or changing the pool, so a queued resize cannot exceed a newly lowered limit.
+
+thinkNXG Pilot also sets `aria-pagecache-buffer-size` to the size of the key buffer and counts it in the budget. MariaDB keeps its on-disk temporary tables in Aria, and its default 128 MB page cache put a 2 GB host's server above its `MemoryHigh` from the start. Above `MemoryHigh` without swap, the kernel can reclaim only the server's code pages, so MariaDB reads them from disk again and again and stops answering. The `size_mariadb_aria_pagecache` patch writes the value into an existing `my.cnf`; it applies when MariaDB next starts.
+
+On a host with less than 800 MB of memory, MariaDB gets a 64 MB buffer pool, an 8 MB key buffer, an 8 MB Aria page cache, and 20 connections, which is enough for one bench with one site. `MemoryHigh` then stays at least a quarter of `MemoryMax` below it.
+
+`mariadb.memory_share` is the share of host memory that thinkNXG Pilot's MariaDB may use, from 0.2 to 0.8 (default 0.5); the benches keep the rest. Settings, Database, Memory split changes it for every bench of the host and re-sizes the running server. Selecting a split clears manual service-limit overrides. When the new limits apply, thinkNXG Pilot saves them in both the main unit and its memory drop-in so they survive a reboot with unchanged RAM. A deferred shrink keeps the previous saved limits until it can apply safely. A larger buffer pool than the running server allows takes effect at the next MariaDB start.
+
+The domain provider controls the edge route for each hostname. Its route policy gives thinkNXG Pilot the public scheme, origin scheme, and client IP source.
+
+thinkNXG Pilot configures PROXY protocol v2 when an HTTPS origin needs it. See [Per-domain TLS](#per-domain-tls).
+
+Set `proxy.cloudflare = true`, or use Settings, Security, Cloudflare settings in Admin, when site domains use Cloudflare's proxy. It applies to the whole host. nginx then takes the client IP from `CF-Connecting-IP`, but only when the connecting address, or the address the edge proxy reports, is one of [Cloudflare's addresses](https://www.cloudflare.com/ips/). It also sets `ssl_prefer_server_ciphers off` on the catch-all TLS server; without it, OpenSSL before 3.5 fails Cloudflare's handshake with a 525. A domain that resolves to Cloudflare's addresses passes the add-domain DNS check with a warning, because thinkNXG Pilot cannot see the server behind the proxy. This check does not need the setting. In Cloudflare, use the Full (strict) SSL mode. In Flexible mode, Cloudflare sends requests to thinkNXG Pilot over HTTP, thinkNXG Pilot redirects them to HTTPS, and the browser loops. Let's Encrypt checks the domain over HTTP, so turn off Always Use HTTPS in Cloudflare until thinkNXG Pilot issues the certificate.
+
+### thinkNXG Cloud
+
+`[frappe_cloud] url` is the thinkNXG Cloud that a site restore copies backups from. The default is `https://cloud.frappe.io`. Set it to use another thinkNXG Cloud, for example a local Press during development.
+
+### Scheduled Backups
+
+Each bench has one hourly `0 * * * *` cron job for scheduled backups. It is installed with the first enrolled site. Sites without a custom backup schedule use this default. New sites are enrolled, including sites created from a backup, and the `enroll_sites_in_scheduled_backups` patch enrolls existing sites that have no backup schedule. Each run reads the last 24 hours of the bench audit log once, then queues a logical backup of the database and site config for each enrolled site with no successful backup in the last 23 hours. Measuring 23 hours keeps each site's backup at the same hour every day. A backup also includes public and private files when the site has no file backup that day (UTC). Physical backups are not scheduled. After six failed backups in 24 hours, the job skips the site until the count drops. The sixth failure since the last successful backup adds a "Backups of <site> are failing" notification to the bench feed. Without S3, scheduled backups stay on disk in `sites/<site>/backups`, outside the directory that thinkNXG prunes. When S3 is configured, every backup streams straight into S3 and writes nothing to disk: thinkNXG Pilot points `frappe backup` at named pipes and uploads what it reads from them as multipart uploads, and a run that fails partway leaves no files in S3. A site with backup encryption turned on in System Settings, or whose setting cannot be read, is backed up to disk and then uploaded instead, because thinkNXG encrypts in a second pass over the finished files. A backup to disk first checks free space and fails at once when the disk cannot hold it and still keep 500 MB free for the system. The newest local database dump plus 20% predicts the database part; with no local dump, the database's size on disk is used, which is an upper bound. File archives count as the size of `public/files` and `private/files`. Expired runs are deleted from S3. The host must have cron and the thinkNXG Pilot task worker running. A scheduled backup does not start while another task holds the site.
+
+After each backup, thinkNXG Pilot clears expired runs with the default GFS policy: every run is kept for 7 days, Sunday runs for 28 days, runs on the first day of a month for 366 days, and January 1 runs for 3,653 days. The newest run is always kept. The `backup_retention` object in `site_config.json` marks this policy with `scheme: "gfs"` and `calendar_rotation: true`. A custom schedule set in the dashboard or through the backup schedule API replaces the default. It installs a cron job for the site and stores a GFS or FIFO retention record without `calendar_rotation`, so the bench job skips the site and the count-based policy clears its runs. Turning off automated backups removes the schedule and the retention record, and the site then keeps only manual backups.
+
+### Telemetry
+
+`[telemetry]` is one credential for both shippers. `endpoint` is the base URL of the region's Datum, with no path: metrics append `/v1/ingest` and logs append `/v1/logs/ingest`. `token` is the JWT Central mints for the region, which Datum tells apart by route rather than by token, so one serves both. `logs_enabled` and `metrics_enabled` switch each shipper independently.
+
+Either shipper runs only when its switch is on and both `endpoint` and `token` are set. Logs are written locally regardless of shipping settings.
+
+`pilot setup telemetry` writes this section and installs the log shipper. Central is asked for the credential when `[central] enabled` is set, and what it returns replaces what is already there, because the token expires. `--endpoint` and `--token` override the fetch. `pilot setup production` does the same, once, before configuring either shipper.
+
+The monitor checks this section on every run, so both shippers start when a credential arrives later, such as from Central's bootstrap. It rewrites the Fluent Bit config and restarts Fluent Bit when the endpoint or token changes, and it starts Fluent Bit again when it is not running. Fluent Bit must be installed. `install.sh` installs it on Debian and Ubuntu. `pilot remove logs` stops Fluent Bit and sets `logs_enabled = false`, so the monitor does not start it again.
+
+### Nginx Ports
+
+`[nginx]` sets the ports that nginx listens on for every bench. The defaults are `http_port = 80` and `https_port = 443`. Change them when another reverse proxy (Traefik, Caddy, or another nginx) owns ports 80 and 443 on the host:
+
+```toml
+[nginx]
+http_port = 8081
+https_port = 8443
+```
+
+Run `pilot setup nginx` on each production bench after a change. The front proxy must forward public ports 80 and 443 to these ports. The HTTP to HTTPS redirect goes to port 443, and Let's Encrypt checks domains on port 80. To keep TLS in thinkNXG Pilot, use TCP passthrough on 443.
+
+### Automatic Updates
+
+Automatic thinkNXG Pilot updates are on by default for release installs. Set `auto_pilot_update = false` under `[updates]` in `common_config.toml` to keep them off. Use the Automatic updates switch in Settings > About, or `pilot admin auto-update on|off`. Both add or remove a cron entry. It checks the UTC time each minute and runs thinkNXG Pilot only at 12:00 AM UTC, regardless of the server timezone. When a newer release exists, the entry queues one `update-cli` task on the first bench by name, so the update shows in that bench's task log. The task updates thinkNXG Pilot and restarts the admin of every bench. The installer and upgrade patch install the schedule unless the setting is off. A source checkout (`dev` version) is never updated this way. Its switch is disabled. A failed update is tried again the next day.
+
+### Alert Delivery
+
+`[resource_limits]` sets when an alert is raised and where it goes. The CPU, memory and disk alerts start at 90%, and `site_uptime` starts on. A usage percentage of `0` disables that alert. The `enable_default_alerts` patch turns the three usage alerts on once, at 90%, on an older host that had all three off. `site_uptime` covers sites that stop answering their ping. thinkNXG Pilot sends the ping to the bench's local app server, so a failure in nginx, TLS, DNS, or the edge proxy does not raise this alert. A condition must hold for five minutes before anything is sent.
+
+Where an alert goes depends on what is configured. A Central-managed host reports every alert to Central; a self-hosted one does not, and the dashboard drops the Central wording along with it. Each `[[webhook_endpoints]]` entry receives events either way. Mail is a third sink, off until a mail server is configured and `email_recipients` is set. Mail and Central get only alerts: `resource_limit_breached`, `site_down` (Central's `site_unavailable`), `backups_failing` (Central's `backup_failure`), and a failed update (Central's `migration_failure`). Central refuses an event type it does not define, so thinkNXG Pilot sends Central's names. Webhooks get every event they chose, including Info events such as a new site or a finished backup. Of the Info events, only long operations that a user waits for (a new, restored or reinstalled site, a finished update, and a thinkNXG Pilot update) also go to the activity feed.
+
+#### Webhooks
+
+`[[webhook_endpoints]]` is a top-level array in `common_config.toml`, because an endpoint receives every kind of event, not only resource alerts. Each endpoint receives a fixed JSON body, like a GitHub webhook. There is no body template. `events` lists the events the endpoint receives. Leave it empty to receive every event, including events added later. `token` is optional. thinkNXG Pilot still reads endpoints from the older place under `[resource_limits]`, as an array or as a `{ url = token }` table, and moves them to the top level on the next save.
+
+| Event | When |
+| --- | --- |
+| `task_failed` | A task failed, except noisy ones such as `build`. |
+| `site_created` | A new site, or a site from a backup, is ready. |
+| `site_deleted` | A site was dropped. |
+| `site_renamed` | A site was renamed. `context.new_name` holds the new name. |
+| `site_restored` | A backup was restored into a site. |
+| `site_reinstalled` | A site was reinstalled. |
+| `site_down` | A site stopped answering its uptime ping. |
+| `site_up` | A site that was reported down answers again. |
+| `backup_completed` | A site backup finished, scheduled or manual. `context.automatic` tells which. |
+| `backup_deleted` | Backups of a site were deleted. |
+| `backups_failing` | A site reached its limit of failed backups. |
+| `app_installed` | An app was installed on a site. |
+| `app_uninstalled` | An app was uninstalled from a site. |
+| `app_added` | An app was added to the bench. |
+| `app_removed` | An app was removed from the bench. |
+| `app_branch_switched` | An app moved to another branch. |
+| `update_completed` | An update finished. |
+| `update_restored` | A failed update was restored from its backup. |
+| `update_dismissed` | A failed update was dismissed. |
+| `pilot_updated` | thinkNXG Pilot itself was updated. |
+| `certificate_issued` | A TLS certificate was issued. |
+| `certificate_expiry` | A TLS certificate has less than 14 days left, so it is not renewing, or has expired. |
+| `certificate_failed` | Certbot could not issue or renew a certificate. |
+| `resource_limit_breached` | CPU, memory, or disk use held above its limit. |
+| `resource_limit_recovered` | Use that was reported above its limit is back under it. |
+| `ping` | The Test button in Settings > Notifications. It goes to every endpoint, whatever events it chose. |
+
+Each request is a `POST` with `Content-Type: application/json`, `User-Agent: Pilot-Hookshot`, `X-Pilot-Event: <event>` and `X-Pilot-Delivery: <id>`. With a token, it also has `Authorization: Bearer <token>` and `X-Pilot-Signature-256: sha256=<hex>`, the HMAC-SHA256 of the raw body keyed with the token. Any 2xx answer counts as delivered.
+
+```json
+{
+  "event": "site_down",
+  "delivery": "5f0c…",
+  "sent_at": "2026-11-04T10:00:00+00:00",
+  "bench": "main",
+  "title": "a.example.com is unreachable",
+  "message": "main: a.example.com unreachable",
+  "severity": "Error",
+  "category": "Sites",
+  "site": "a.example.com",
+  "url": "https://admin.example.com/sites/a.example.com",
+  "context": {"bench": "main", "sites": ["a.example.com"]}
+}
+```
+
+For a task event, `context` holds `command`, `task_id`, and the task arguments that are safe to share, such as `site`, `name`, `new_name`, `app`, `apps`, `branch`, and `automatic`. Passwords, tokens, and repository URLs are never sent.
+
+Outgoing mail lives in the bench's `sites/common_site_config.json`, under the keys the framework's Email Account already reads, so a site picks the same mailbox up without any further setup:
+
+```json
+{
+  "mail_server": "smtp.example.com",
+  "mail_port": 587,
+  "auto_email_id": "alerts@example.com",
+  "mail_login": "alerts@example.com",
+  "mail_password": "secret",
+  "use_tls": 1
+}
+```
+
+- `mail_server` is the outgoing mail server, `mail_port` the port it listens on
+- `use_tls` upgrades the connection with STARTTLS
+- `use_ssl` connects over SSL instead, with `use_tls` set to `0`. The framework reads `use_ssl` from thinkNXG v16 with frappe/frappe#44142.
+- `mail_port` may be left at `0`, which means 465 with SSL and 587 with STARTTLS
+- `auto_email_id` is the address alerts are sent from, and the login name by default
+- `mail_login` only when the server expects a login name that is not that address
+- a relay that takes no credentials gets `disable_mail_smtp_authentication` instead of a password
+
+Each site's `site_config.json` has `email_sender_name`, the display name on mail that the site sends through this mailbox without a sender name of its own, such as a password reset. Mail that a user sends keeps that user's name. A restore keeps the target site's value. thinkNXG Pilot sets it from the first label of the site name when it creates the site, and changes it when the site is renamed. It changes `-` and `_` to spaces and starts each word with a capital letter, such as `Acme Corp` for `acme-corp.example.com`. A rename keeps a value that you set yourself.
+
+The certificate is verified in both modes, so a server with a self-signed certificate is refused rather than trusted silently.
+
+Saving these through the Admin UI opens a session against the server first, so a wrong password or an unreachable host is reported then rather than at the first alert. The Admin API never returns the password, reporting only whether one is stored.
+
+`email_recipients` is edited on the notification settings page, the mailbox on its own one, so either may be saved before the other exists.
+
+## Credentials and URLs
+
+Database passwords are passed through environment variables, not command-line arguments. MariaDB site setup uses a temporary, site-scoped account; Postgres setup requires the configured superuser.
+
+`admin.jwks_url`, `telemetry.endpoint`, and `llm.api_base` must use `http` or `https`, contain no credentials, and must not target link-local or cloud metadata hosts. Loopback and private addresses are allowed. Validation checks the hostname itself, not where DNS resolves it.
+
+After upgrading an old bench, `merge_common_config` moves host-wide fields from `bench.toml` into `common_config.toml`. Run `pilot admin run-patches` if needed.

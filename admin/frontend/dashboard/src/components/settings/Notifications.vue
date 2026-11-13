@@ -1,0 +1,407 @@
+<script setup lang="ts">
+import { Button, ErrorMessage, MultiSelect, Spinner, Switch, TextInput, toast } from 'frappe-ui'
+import { computed, onMounted, ref } from 'vue'
+import { RouterLink } from 'vue-router'
+import { notificationsApi } from '@/api/notifications'
+import { settingsApi } from '@/api/settings'
+import EmptyState from '@/components/common/EmptyState.vue'
+import TagsInput from '@/components/common/TagsInput.vue'
+import NotificationsIllustration from '@/components/settings/NotificationsIllustration.vue'
+import { useSession } from '@/composables/auth/useSession'
+import type { WebhookEventOption, WebhookTestResult } from '@/types/settings'
+import { errorMessage } from '@/utils/error'
+
+interface WebhookForm {
+  url: string
+  token: string
+  token_set: boolean
+  original_url: string
+  events: string[]
+  testing?: boolean
+  test?: { ok: boolean; message: string }
+}
+
+const { session, centralServerUrl } = useSession()
+
+const RESOURCE_ALERTS = [
+  {
+    key: 'cpu_usage_limit',
+    label: 'CPU usage',
+    metric: 'processor use',
+    description: 'Alert when processor use on this host crosses the limit.',
+  },
+  {
+    key: 'memory_usage_limit',
+    label: 'Memory usage',
+    metric: 'memory use',
+    description: 'Alert when memory use on this host crosses the limit.',
+  },
+  {
+    key: 'disk_space_limit',
+    label: 'Disk usage',
+    metric: 'disk use',
+    description: 'Alert when disk use on this host crosses the limit.',
+  },
+]
+
+const loading = ref(true)
+const saving = ref(false)
+const error = ref('')
+// The switch owns whether an alert is on, so clearing the field keeps it mounted.
+const enabled = ref(Object.fromEntries(RESOURCE_ALERTS.map((alert) => [alert.key, false])))
+const limits = ref(Object.fromEntries(RESOURCE_ALERTS.map((alert) => [alert.key, ''])))
+const siteUptime = ref(true)
+const webhooks = ref<WebhookForm[]>([])
+const webhookEvents = ref<WebhookEventOption[]>([])
+const recipients = ref<string[]>([])
+const mailConfigured = ref(false)
+const mailRoute = { name: 'Settings', params: { section: 'mail' } }
+
+const invalidRecipient = computed(() => recipients.value.find((address) => !isAddress(address)))
+
+const savedPayload = ref('')
+const dirty = computed(() => JSON.stringify(buildPayload()) !== savedPayload.value)
+
+const buildPayload = () => {
+  return {
+    resource_limits: {
+      ...Object.fromEntries(
+        RESOURCE_ALERTS.map((alert) => [
+          alert.key,
+          enabled.value[alert.key] ? Number(limits.value[alert.key]) || 0 : 0,
+        ]),
+      ),
+      site_uptime: siteUptime.value,
+      email_recipients: recipients.value.map((address) => address.trim()).filter(Boolean),
+    },
+    // Blank token means "keep the stored one"; original_url is how it is found.
+    webhook_endpoints: webhooks.value.map(webhookEntry),
+  }
+}
+
+// No chosen events means every event, so an endpoint added today also gets events added later.
+const webhookEntry = (webhook: WebhookForm) => ({
+  url: webhook.url.trim(),
+  token: webhook.token,
+  original_url: webhook.original_url,
+  events: webhook.events,
+})
+
+const isAddress = (address: string) => /^[^@\s]+@[^@\s]+$/.test(address.trim())
+
+const setEnabled = (key: string, on: boolean) => {
+  enabled.value[key] = on
+
+  if (on && !Number(limits.value[key])) limits.value[key] = '90'
+}
+
+const addWebhook = () => {
+  webhooks.value.push({ url: '', token: '', token_set: false, original_url: '', events: [] })
+}
+
+const removeWebhook = (index: number) => {
+  webhooks.value.splice(index, 1)
+}
+
+// A row still being filled in says nothing and just holds the Save button.
+const webhookError = (webhook: WebhookForm) => {
+  const url = webhook.url.trim()
+  if (url && (!URL.canParse(url) || !/^https?:\/\//.test(url)))
+    return 'Endpoint must be an http:// or https:// URL.'
+  return ''
+}
+
+const testWebhook = async (webhook: WebhookForm) => {
+  webhook.testing = true
+  webhook.test = undefined
+  try {
+    webhook.test = testOutcome(await notificationsApi.testWebhook(webhookEntry(webhook)))
+  } catch (e) {
+    webhook.test = { ok: false, message: errorMessage(e, 'Could not send the test event.') }
+  } finally {
+    webhook.testing = false
+  }
+}
+
+const testOutcome = (result: WebhookTestResult) => {
+  if (result.is_success) return { ok: true, message: `Test event delivered. The endpoint answered ${result.status}.` }
+  const body = result.body.trim().slice(0, 200)
+  return { ok: false, message: `The endpoint answered ${result.status}${body ? `: ${body}` : '.'}` }
+}
+
+const limitError = (key: string) => {
+  if (!enabled.value[key]) return ''
+  const limit = Number(limits.value[key])
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100)
+    return 'Limit must be a whole percentage between 1 and 100.'
+  return ''
+}
+
+const canSave = computed(
+  () =>
+    RESOURCE_ALERTS.every((alert) => !limitError(alert.key)) &&
+    webhooks.value.every((webhook) => webhook.url.trim() && !webhookError(webhook)) &&
+    !invalidRecipient.value,
+)
+
+const save = async () => {
+  if (!canSave.value) return
+
+  error.value = ''
+  saving.value = true
+  try {
+    await settingsApi.update(buildPayload())
+    // Drop the typed secrets once stored, so the form reads back like a reload.
+    for (const webhook of webhooks.value) {
+      webhook.token_set = webhook.token_set || Boolean(webhook.token)
+      webhook.token = ''
+      webhook.original_url = webhook.url.trim()
+    }
+    savedPayload.value = JSON.stringify(buildPayload())
+    toast.success('Notification settings saved')
+  } catch (e) {
+    error.value = errorMessage(e, 'Failed to save.')
+  } finally {
+    saving.value = false
+  }
+}
+
+onMounted(async () => {
+  try {
+    const data = await settingsApi.get()
+    const saved = data.resource_limits || {}
+    const savedLimits: Record<string, unknown> = { ...saved }
+
+    for (const alert of RESOURCE_ALERTS) {
+      const limit = Number(savedLimits[alert.key]) || 0
+      enabled.value[alert.key] = limit > 0
+      limits.value[alert.key] = limit ? String(limit) : ''
+    }
+    siteUptime.value = saved.site_uptime ?? true
+    webhooks.value = (data.webhook_endpoints || []).map((webhook) => ({
+      url: webhook.url || '',
+      token: '',
+      token_set: Boolean(webhook.token_set),
+      original_url: webhook.url || '',
+      events: [...(webhook.events || [])],
+    }))
+    webhookEvents.value = data.webhook_events || []
+    recipients.value = [...(saved.email_recipients || [])]
+    mailConfigured.value = Boolean(data.mail?.server)
+    savedPayload.value = JSON.stringify(buildPayload())
+  } catch (e) {
+    error.value = errorMessage(e, 'Could not load settings.')
+  } finally {
+    loading.value = false
+  }
+})
+</script>
+
+<template>
+  <div v-if="loading" class="flex justify-center items-center h-40">
+    <Spinner size="lg" class="text-ink-gray-4" />
+  </div>
+
+  <div v-else class="space-y-8">
+    <p v-if="session.centralEnabled" class="text-ink-gray-6 text-p-sm">
+      This server is managed by
+      <a
+        v-if="session.centralUrl"
+        :href="centralServerUrl()"
+        target="_blank"
+        rel="noopener"
+        class="inline-flex items-center gap-0.5 text-p-sm-medium text-ink-gray-8 hover:text-ink-gray-9"
+      >
+        <span>Central</span>
+        <span class="size-3 lucide-arrow-up-right" aria-hidden="true" />
+      </a><template v-else>Central</template>, so alerts also show there.
+    </p>
+
+    <div class="-mx-3 -mt-3.5 inset-dividers">
+      <div
+        class="flex justify-between items-center gap-4 px-3 py-3.5 rounded-5 transition-colors cursor-pointer hover:bg-surface-gray-2"
+        @click="siteUptime = !siteUptime"
+      >
+        <div class="flex flex-col gap-1">
+          <p class="text-base-medium text-ink-gray-8">Site uptime</p>
+
+          <p class="text-ink-gray-6 text-p-sm">
+            Alert when a site stops responding to its uptime check.
+          </p>
+        </div>
+
+        <Switch v-model="siteUptime" @click.stop />
+      </div>
+
+      <div
+        v-for="alert in RESOURCE_ALERTS"
+        :key="alert.key"
+        class="flex justify-between items-center gap-4 px-3 py-3.5 rounded-5 transition-colors cursor-pointer hover:bg-surface-gray-2"
+        @click="setEnabled(alert.key, !enabled[alert.key])"
+      >
+        <div class="flex flex-col gap-1">
+          <p class="text-base-medium text-ink-gray-8">{{ alert.label }}</p>
+
+          <p v-if="enabled[alert.key]" class="flex items-center gap-1.5 text-ink-gray-6 text-p-sm">
+            Alert when {{ alert.metric }} goes above
+            <TextInput
+              v-model="limits[alert.key]"
+              type="number"
+              min="1"
+              max="100"
+              size="xs"
+              class="-my-0.5 w-14"
+              :aria-label="`${alert.label} limit`"
+              @click.stop
+            />
+            %
+          </p>
+
+          <p v-else class="text-ink-gray-6 text-p-sm">{{ alert.description }}</p>
+        </div>
+
+        <Switch
+          :model-value="enabled[alert.key]"
+          @click.stop
+          @update:model-value="(on: boolean) => setEnabled(alert.key, on)"
+        />
+      </div>
+    </div>
+
+    <div class="space-y-2">
+      <h4 class="text-base-medium text-ink-gray-8">Email recipients</h4>
+
+      <p class="text-ink-gray-6 text-p-sm">
+        Alerts are emailed to these addresses from the
+        <RouterLink :to="mailRoute" class="mail-link">mailbox</RouterLink>
+        in Mail settings.
+      </p>
+
+      <TagsInput
+        v-model="recipients"
+        variant="outline"
+        placeholder="Add an email"
+        :is-invalid="(address) => !isAddress(address)"
+      />
+
+      <p v-if="invalidRecipient" class="text-ink-red-5 text-p-sm">
+        {{ invalidRecipient }}
+        is not an email address.
+      </p>
+
+      <p v-else-if="recipients.length && !mailConfigured" class="text-ink-amber-6 text-p-sm">
+        Set up a mailbox before these addresses receive anything.
+      </p>
+    </div>
+
+    <div class="space-y-2">
+      <h4 class="text-base-medium text-ink-gray-8">Webhook endpoints</h4>
+
+      <p class="text-ink-gray-6 text-p-sm">
+        Each endpoint gets a JSON POST for the events it chose. A token is sent in the
+        <code>Authorization</code>
+        header and signs the body in
+        <code>X-Pilot-Signature-256</code>.
+      </p>
+
+      <div
+        class="dark:bg-surface-gray-1 border border-outline-gray-1 dark:border-transparent rounded-7 overflow-hidden"
+      >
+        <EmptyState
+          compact
+          v-if="!webhooks.length"
+          :bordered="false"
+          title="No webhook endpoints"
+          description="Add one to send alerts to your own service."
+          class="py-8"
+        >
+          <template #illustration>
+            <NotificationsIllustration kind="webhook" />
+          </template>
+        </EmptyState>
+
+        <div
+          v-else
+          class="items-center gap-x-3 gap-y-2 grid grid-cols-[1fr_8rem_9rem_4.5rem] sm:grid-cols-[1fr_10rem_11rem_4.5rem] p-4"
+        >
+          <span class="text-ink-gray-5 text-sm">Endpoint URL</span>
+          <span class="text-ink-gray-5 text-sm">Token</span>
+          <span class="text-ink-gray-5 text-sm">Events</span>
+          <span />
+
+          <template v-for="(webhook, index) in webhooks" :key="index">
+            <TextInput v-model="webhook.url" placeholder="https://alerts.example.com/pilot" />
+
+            <TextInput
+              v-model="webhook.token"
+              type="password"
+              autocomplete="new-password"
+              :placeholder="webhook.token_set ? 'Unchanged' : 'Optional'"
+            />
+
+            <MultiSelect
+              v-model="webhook.events"
+              :options="webhookEvents"
+              placeholder="All events"
+              :filterable="false"
+              aria-label="Events"
+              class="w-full"
+            />
+
+            <div class="flex">
+              <Button
+                icon="lucide-send"
+                variant="ghost"
+                label="Send a test event"
+                tooltip="Send a test event"
+                :loading="webhook.testing"
+                :disabled="!webhook.url.trim() || Boolean(webhookError(webhook))"
+                @click="testWebhook(webhook)"
+              />
+
+              <Button
+                icon="lucide-x"
+                variant="ghost"
+                label="Remove endpoint"
+                tooltip="Remove endpoint"
+                @click="removeWebhook(index)"
+              />
+            </div>
+
+            <p v-if="webhookError(webhook)" class="col-span-4 -mt-1 text-ink-red-5 text-p-sm">
+              {{ webhookError(webhook) }}
+            </p>
+
+            <p
+              v-else-if="webhook.test"
+              class="col-span-4 -mt-1 text-p-sm break-words"
+              :class="webhook.test.ok ? 'text-ink-green-6' : 'text-ink-red-5'"
+            >
+              {{ webhook.test.message }}
+            </p>
+          </template>
+        </div>
+
+        <footer class="flex justify-between items-center px-3 py-2.5 border-outline-gray-2 border-t">
+          <Button
+            variant="ghost"
+            icon-left="lucide-plus"
+            label="Add endpoint"
+            @click="addWebhook"
+          />
+          <Button v-if="dirty" variant="solid" :loading="saving" :disabled="!canSave" @click="save">
+            Save changes
+          </Button>
+        </footer>
+      </div>
+    </div>
+
+    <ErrorMessage v-if="error" :message="error" />
+  </div>
+</template>
+
+<style scoped>
+.mail-link {
+  @apply text-ink-gray-7 underline decoration-dotted decoration-2 decoration-[--ink-gray-4] underline-offset-2 hover:text-ink-gray-8;
+}
+</style>

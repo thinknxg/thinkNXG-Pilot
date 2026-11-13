@@ -1,0 +1,185 @@
+# @frappe/cloud-sdk
+
+Use Cloud Settings in a thinkNXG app. The SDK provides typed API calls and a ready-to-use settings dialog. It works in Desk, React, Vue, and plain browser pages.
+
+Use the shared dialog for a consistent Cloud Settings experience across apps. If your app needs its own UI, use the API calls without the dialog.
+
+## Requirements
+
+- A Pilot-managed thinkNXG site with the Cloud Settings server APIs.
+- A signed-in user with the System Manager role.
+- The site's session cookie. Write calls also need `frappe.csrf_token` or `window.csrf_token`.
+
+The server checks access on every call. The browser does not receive thinkNXG Pilot or Central credentials.
+
+## Install
+
+```sh
+npm install @frappe/cloud-sdk
+```
+
+The package holds the API calls and a small loader. It does not hold the UI. When you first open the dialog, the loader imports the UI from the site's thinkNXG Pilot server, at the `esm/` path next to the script URL in `bundle.js` of `get_context`. Each panel then loads when it is first shown. So a thinkNXG Pilot update changes the UI in every app, and your app does not need a new release. You do not need to add Vue, thinkNXG UI, or a stylesheet to your app.
+
+The browser must reach the thinkNXG Pilot server, and the page's Content Security Policy must allow scripts from it. If the UI does not load, `openCloudSettings()` rejects with a message that says so.
+
+The dialog uses the Inter font. If the page does not load Inter, the dialog adds it to the page the first time it opens.
+
+## Open Cloud Settings
+
+Show your button only when `isCloudSettingsAvailable()` returns `true`. Call `openCloudSettings()` when the user clicks it.
+
+```ts
+import { isCloudSettingsAvailable, openCloudSettings, closeCloudSettings } from '@frappe/cloud-sdk'
+
+const available = await isCloudSettingsAvailable()
+
+async function openSettings() {
+  try {
+    await openCloudSettings({ panels: ['billing', 'domains', 'advanced'] })
+  } catch (error) {
+    // Show this message in your app's alert or error component.
+    console.error(error instanceof Error ? error.message : 'Could not open Cloud Settings.')
+  }
+}
+
+// Call this when the host page or component is removed.
+closeCloudSettings()
+```
+
+In React, use `onClick={openSettings}`. In Vue, use `@click="openSettings"`. In a plain page, use `button.addEventListener('click', openSettings)`. Disable the button while the dialog opens.
+
+Availability is asynchronous. It returns `false` for an unavailable site or a permission denial. A connection error rejects the call. Handle that error in your app too. Importing the package is safe during server rendering. Opening the dialog requires a browser.
+
+## Select panels and appearance
+
+```ts
+await openCloudSettings({
+  panels: ['billing', 'domains'],
+  tab: 'domains',
+  theme: 'auto',
+  onClose: () => console.log('Cloud Settings closed'),
+})
+```
+
+| Option | Purpose |
+| --- | --- |
+| `panels` | Select which panels to show. Omit it or use an empty array to show all. Unknown names are ignored. This option does not change permissions. |
+| `tab` | Select the first panel. The default is the first visible panel. |
+| `theme` | Use `auto`, `light`, or `dark`. Auto follows `html[data-theme="dark"]` or `html.dark`. |
+| `translate` | Supply `(message, values?) => string`. The default uses thinkNXG's translation catalog and replaces numbered values. |
+| `onClose` | Run a callback after the dialog closes. |
+| `context` | Supply a `CloudContext`. Without it, the SDK reads the current site's context. |
+| `target` | Render the panels inside this element instead of a dialog. See [Mount inline](#mount-inline). |
+
+Panel names: `billing`, `marketplace`, `analytics`, `domains`, `backups`, `usage`, `site-config`, `maintenance`, and `advanced`.
+
+The dialog uses Espresso components. On a phone, it fills the viewport and has a panel selector. It keeps clear of the notch and the home indicator when the page sets `viewport-fit=cover` in its viewport meta tag. On a desktop, it has a sidebar. Its styles, menus, dialogs, alerts, and toasts stay inside a shadow root. Closing removes the UI and returns focus to the button. Opening again replaces the current dialog. Closing also cancels a pending open.
+
+## Mount inline
+
+An app with its own settings page can show the panels inside it. Pass the element to fill as `target`. The panels fill its height, so give the element one. With one panel, the UI has no sidebar and no panel selector, so the app's own navigation stays the only one. With several panels, the sidebar shows inside the element.
+
+```ts
+await openCloudSettings({ target: document.querySelector('#cloud-settings'), panels: ['billing'] })
+
+// Call this when the host page or component is removed.
+closeCloudSettings()
+```
+
+Opening again, inline or as a dialog, replaces the mounted UI. Menus, dialogs, and toasts stay inside the element's shadow root.
+
+The inline UI is in the tab order, so Tab moves from the host page into the panels. A host can show the inline UI inside its own modal. Then Esc, or a click outside the open Cloud menu or dialog, closes it and also the host modal. To prevent this, ignore the modal's close while `fc-cloud-settings[overlay-open]` exists. The element has this attribute while a Cloud menu or dialog is open.
+
+```ts
+const isCloudOverlayOpen = () => !!document.querySelector('fc-cloud-settings[overlay-open]')
+```
+
+```vue
+<Dialog :open="show" @update:open="(open) => (open || !isCloudOverlayOpen()) && (show = open)">
+```
+
+## Use API calls without the dialog
+
+You can build your own pages, panels, or controls with the API calls. The `/api` import does not load the shared UI. Your app controls the layout and handles loading, empty states, errors, and success feedback.
+
+```ts
+import { getBilling, getDomains } from '@frappe/cloud-sdk/api'
+
+const billing = await getBilling()
+const domains = await getDomains()
+```
+
+The root import and `/api` export the same API calls and TypeScript models. Use `/api` when you only need data.
+
+Build your own UI on the read calls, for example a plan badge or a banner. For changes, open the dialog on the right panel, such as `openCloudSettings({ tab: 'billing' })`. The action calls follow the dialog's flows, and their steps can change between versions. Payment setup is an example.
+
+| Area | Read calls | Action calls |
+| --- | --- | --- |
+| Site | `getContext`, `getAccountUrl`, `getTask` | None |
+| Billing | `getBilling`, `getPlanOptions`, `getBillingProfile`, `getPaymentGateways` | Change plan, save profile, set up or remove a payment method, reconcile setup |
+| Apps | `getMarketplaceApps` | Install, uninstall, update |
+| Domains | `getDomains` | Read DNS records, add, remove, set primary |
+| Backups | `getBackups`, `getBackupDownloadLinks` | Create, delete |
+| Monitoring | `getAnalytics`, `getUptime`, `getStorage` | Refresh storage |
+| Site config | `getSiteConfig` | Update config |
+| Maintenance | None | Clear cache, migrate |
+
+Requests use the current origin and session. They time out after 30 seconds. The SDK does not retry write calls.
+
+`changePlan(plan)` returns `{ queued, resized, progress_url }`. A new size stops the site for a few minutes. When `progress_url` is set, open it: the page lives on Central and brings the user back when the site is ready. During a free trial, the call resizes nothing: Central keeps the plan, and the site moves to it when a payment method converts the trial. `getPlanOptions` then lists the paid plans the trial may move to, with `selected` set to the plan it moves to. `getBilling` returns `plan_change.progress_url` while a plan change runs, such as that move.
+
+## Handle feedback and errors
+
+| State | Dialog behavior |
+| --- | --- |
+| Loading | Show a skeleton in the panel. |
+| No data | Show an empty message and the next available action. |
+| Load failed | Show an error in the panel with a Try again button. |
+| Form or action failed | Show the error beside the form or action. |
+| Action running | Show a loading button and disable conflicting actions. |
+| Action complete | Refresh the data or show a short success toast. |
+| Task still running | Show a background status message. Closing the UI stops polling, not the server task. |
+
+Direct API calls and errors before the dialog opens belong to your app. Catch `CloudSettingsError` and show its `message`. It also has `status`, `serverMessages`, and `excType`. Status `0` means a network failure. Messages are plain text.
+
+## Use the Desk bundle
+
+thinkNXG Pilot serves two builds of the same UI under `/embed/cloud-settings/`:
+
+| Path | Format | Used by |
+|---|---|---|
+| `cloud-settings.js` | One classic script | Desk, through `frappe.cloudSettings.show(context, options)`. It also exposes `window.FrappeCloudSettings` with the same availability, open, and close methods. |
+| `esm/cloud-settings.js` and `esm/chunks/` | ES module with a chunk per panel | The npm package |
+
+Both entry files revalidate on every load, so a thinkNXG Pilot update takes effect at once. Chunk names contain a content hash, so the browser caches them for a year. The ES files are sent with `Access-Control-Allow-Origin: *`, because a site imports them from the thinkNXG Pilot origin.
+
+## What needs a release
+
+| Change | Release |
+|---|---|
+| Anything inside the dialog, such as copy, layout, fields, or flows that use existing calls | thinkNXG Pilot update |
+| New data in a response | Central deploy. The thinkNXG proxy passes responses through. |
+| A new or renamed call the dialog makes | thinkNXG release, because the whitelisted proxy methods live in thinkNXG |
+| The public API of this package: `openCloudSettings` options, panel names, `isCloudSettingsAvailable`, or the typed calls in `@frappe/cloud-sdk/api` | New version of this package, then an upgrade in each app |
+
+## Release
+
+Raise `version` in `package.json` and `package-lock.json` in a pull request. When it merges into `develop`, the `Publish Cloud SDK` workflow tests, builds and publishes that version to npm. It skips a version that npm already has. Run the workflow by hand to publish the current version again after a failed run.
+
+npm trusts the workflow through trusted publishing, so the repository holds no npm token. A package maintainer sets this once on npmjs.com: in the `@frappe/cloud-sdk` settings, add a GitHub Actions trusted publisher for the repository `frappe/pilot` and the workflow `cloud-sdk-publish.yml`.
+
+## Build and test
+
+Run `npm test` and `npm run build` in this package. Run `npm run build` in `admin/frontend/in-app-embed` to build both thinkNXG Pilot outputs into `admin/backend/static/in-app-embed/cloud-settings/`. That build also checks that the ES runtime exports its methods, contains its styles, and loads panels on demand.
+
+To run browser regression tests, install the dependencies in `admin/frontend/dashboard` and `admin/frontend/in-app-embed`, then build this package and the in-app embed. Run `npx playwright install chromium` and `npx playwright test --config cloud-settings.config.ts` from `admin/frontend/dashboard`. The tests check that the SDK loads the UI from thinkNXG Pilot and loads a panel only when it is shown, dialog cleanup, custom feedback translations, task cancellation and resume, and the phone layout. `cloud-settings-billing.spec.ts` checks the billing tab: the trial notice and its states, the billing details and payment steps during a trial, the country and Indian state lists, a card that fails verification, the plan list, the move to the progress page, and the refusal, spending limit and retry states. CI runs these tests in the MariaDB browser job.
+
+To test all panels with sample data, build this package and the in-app embed. Run `python3 -m http.server 8123` from the repository root. Open `http://localhost:8123/admin/frontend/cloud-sdk/tests/embed.html`. No real payment or site action runs in this fixture.
+
+To test billing without host metadata, run this from the thinkNXG Pilot repository:
+
+```sh
+.venv/bin/python -m scripts.cloud_settings_simulator --bench-root /path/to/local/bench
+```
+
+Use a local development site that has the server APIs and a button to open the dialog. Set that site's `pilot_endpoint` to `http://127.0.0.1:8003`, then clear its cache. Keep its existing site token. Sign in as a System Manager and open Billing. The simulation controls are at `http://127.0.0.1:8124`. Save the sample profile, complete the local checkout, then click Check status. To test the trial flow, choose **Start a free trial** on the controls page: Billing then shows an open trial, and a completed checkout converts it. You can reset the data or simulate an API failure. State stays in memory. Billing makes no real charges. Other thinkNXG Pilot operations still use the real local bench. Stop the simulator and restore the original endpoint when finished.
